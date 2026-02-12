@@ -1,0 +1,1 @@
+console.log('Love/Nope actions disabled: missing APPS_SCRIPT_WEBAPP_URL');

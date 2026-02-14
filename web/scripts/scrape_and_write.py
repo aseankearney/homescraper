@@ -65,6 +65,12 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 ]
 
+DETAIL_SQFT_FETCH_LIMIT_PER_CITY = 35
+DETAIL_SQFT_FETCH_TIMEOUT_SECONDS = 20
+DETAIL_SQFT_FETCH_SLEEP_RANGE_SECONDS = (0.8, 1.6)
+
+BACKFILL_MISSING_SQFT_LIMIT = 30
+
 
 def normalize_city(city: str) -> str:
     key = city.strip().lower()
@@ -129,6 +135,7 @@ def extract_square_feet(text: str) -> Optional[int]:
     patterns = [
         r"(\d{3,5})\s*(?:sq\.?\s*ft\.?|sqft|sf)\b",
         r"\b(\d{3,5})\s*-\s*sq\.?\s*ft\.?\b",
+        r"(\d{3,5})\s*ft2\b",
     ]
     for pattern in patterns:
         m = re.search(pattern, text, re.IGNORECASE)
@@ -138,6 +145,60 @@ def extract_square_feet(text: str) -> Optional[int]:
         if 200 <= value <= 20000:
             return value
     return None
+
+
+def is_blocked_html(html_text: str) -> bool:
+    lower = html_text.lower()
+    return (
+        "your request has been blocked" in lower
+        or "<title>blocked</title>" in lower
+        or "help_blocks" in lower
+    )
+
+
+def make_headers(referer: str) -> Dict[str, str]:
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": referer,
+    }
+
+
+def fetch_listing_detail_sqft(
+    session: requests.Session, listing_url: str
+) -> Optional[int]:
+    """
+    Try harder: fetch the listing detail page and extract sqft.
+
+    Craigslist often encodes sqft as `850ft2` in the posting attribute group.
+    """
+    try:
+        resp = session.get(
+            listing_url,
+            headers=make_headers("https://losangeles.craigslist.org/"),
+            timeout=DETAIL_SQFT_FETCH_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return None
+
+    if resp.status_code != 200:
+        return None
+    if is_blocked_html(resp.text):
+        return None
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Most reliable: attribute group spans (e.g. "2BR / 1Ba 850ft2")
+    attr_texts = [s.get_text(" ", strip=True) for s in soup.select(".attrgroup span")]
+    combined = " ".join(attr_texts)
+    sqft = extract_square_feet(combined)
+    if sqft:
+        return sqft
+
+    # Fallback: search whole body (slower, but catches some posts)
+    body_text = soup.get_text(" ", strip=True)
+    return extract_square_feet(body_text)
 
 
 def extract_price(text: str) -> int:
@@ -200,7 +261,9 @@ def append_rows(service, sheet_id: str, rows: List[List[object]]) -> None:
     )
 
 
-def fetch_city(city_query: str) -> List[Dict[str, object]]:
+def fetch_city(
+    session: requests.Session, city_query: str, existing_ids: Set[str]
+) -> List[Dict[str, object]]:
     encoded = quote_plus(city_query)
     url = (
         "https://losangeles.craigslist.org/search/apa?"
@@ -212,25 +275,18 @@ def fetch_city(city_query: str) -> List[Dict[str, object]]:
         "&sale_date=all+dates"
     )
 
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://losangeles.craigslist.org/",
-    }
-
-    resp = requests.get(url, headers=headers, timeout=25)
+    resp = session.get(url, headers=make_headers("https://losangeles.craigslist.org/"), timeout=25)
     if resp.status_code != 200:
         raise RuntimeError(f"HTTP {resp.status_code}")
 
-    lower = resp.text.lower()
-    if "your request has been blocked" in lower:
+    if is_blocked_html(resp.text):
         raise RuntimeError("Blocked by Craigslist")
 
     soup = BeautifulSoup(resp.text, "html.parser")
     cards = soup.select(".cl-static-search-result, .result-row")
 
     listings: List[Dict[str, object]] = []
+    detail_fetches = 0
     for card in cards:
         link_tag = card.select_one("a[href]")
         if not link_tag:
@@ -279,6 +335,16 @@ def fetch_city(city_query: str) -> List[Dict[str, object]]:
         id_match = re.search(r"/(\d+)\.html", full_url)
         listing_id = f"craigslist:{id_match.group(1)}" if id_match else f"craigslist:{hash(full_url)}"
 
+        # Skip if we already have this listing (avoids extra detail-page fetches)
+        if listing_id in existing_ids:
+            continue
+
+        # If sqft isn't in the search-card snippet, fetch the detail page (limited)
+        if not sqft and detail_fetches < DETAIL_SQFT_FETCH_LIMIT_PER_CITY:
+            sqft = fetch_listing_detail_sqft(session, full_url)
+            detail_fetches += 1
+            time.sleep(random.uniform(*DETAIL_SQFT_FETCH_SLEEP_RANGE_SECONDS))
+
         listings.append(
             {
                 "listing_id": listing_id,
@@ -319,6 +385,52 @@ def listing_to_row(l: Dict[str, object]) -> List[object]:
     ]
 
 
+def get_recent_missing_sqft_rows(
+    service, sheet_id: str, limit: int
+) -> List[Dict[str, object]]:
+    """
+    Backfill sqft for recent rows where sqft column is empty.
+    Returns rows with row_num + url + listing_id.
+    """
+    res = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=sheet_id, range="Sheet1!A2:L")
+        .execute()
+    )
+    values = res.get("values", [])
+
+    missing: List[Dict[str, object]] = []
+    # Walk from bottom so we backfill newest first.
+    for idx in range(len(values) - 1, -1, -1):
+        row = values[idx]
+        listing_id = row[0] if len(row) > 0 else ""
+        url = row[10] if len(row) > 10 else ""
+        sqft_val = row[11] if len(row) > 11 else ""
+        if not listing_id or not url:
+            continue
+        if str(sqft_val).strip() != "":
+            continue
+        missing.append({"row_num": idx + 2, "url": url, "listing_id": listing_id})
+        if len(missing) >= limit:
+            break
+    return missing
+
+
+def update_sqft_cell(service, sheet_id: str, row_num: int, sqft: int) -> None:
+    (
+        service.spreadsheets()
+        .values()
+        .update(
+            spreadsheetId=sheet_id,
+            range=f"Sheet1!L{row_num}",
+            valueInputOption="RAW",
+            body={"values": [[sqft]]},
+        )
+        .execute()
+    )
+
+
 def main() -> None:
     started_at = datetime.now(timezone.utc).isoformat()
     print(f"[scrape] started at {started_at}")
@@ -327,13 +439,14 @@ def main() -> None:
     service = get_sheets_service()
     sheet_id = get_sheet_id()
     existing_ids = get_existing_ids(service, sheet_id)
+    session = requests.Session()
 
     all_listings: List[Dict[str, object]] = []
     errors: List[str] = []
 
     for city in SEARCH_CONFIG["locations"]:
         try:
-            city_listings = fetch_city(city)
+            city_listings = fetch_city(session, city, existing_ids)
             all_listings.extend(city_listings)
             print(f"✓ {city}: {len(city_listings)} listings")
         except Exception as exc:  # noqa: BLE001
@@ -355,12 +468,25 @@ def main() -> None:
     rows = [listing_to_row(l) for l in new_listings]
     append_rows(service, sheet_id, rows)
 
+    # Backfill sqft for recent rows missing it (kept small to avoid blocks)
+    backfill_done = 0
+    backfill_candidates = get_recent_missing_sqft_rows(
+        service, sheet_id, BACKFILL_MISSING_SQFT_LIMIT
+    )
+    for candidate in backfill_candidates:
+        sqft = fetch_listing_detail_sqft(session, str(candidate["url"]))
+        if sqft:
+            update_sqft_cell(service, sheet_id, int(candidate["row_num"]), sqft)
+            backfill_done += 1
+        time.sleep(random.uniform(*DETAIL_SQFT_FETCH_SLEEP_RANGE_SECONDS))
+
     summary = {
         "startedAt": started_at,
         "totalFetched": len(all_listings),
         "dedupedFetched": len(deduped),
         "newListings": len(new_listings),
         "addedCount": len(rows),
+        "sqftBackfilled": backfill_done,
         "errorCount": len(errors),
         "errors": errors,
     }

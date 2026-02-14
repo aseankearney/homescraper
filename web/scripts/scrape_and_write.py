@@ -27,7 +27,19 @@ SEARCH_CONFIG = {
         "Oak Park",
         "Simi Valley",
     ],
-    "max_per_city": 120,
+    "max_per_city": 150,
+}
+
+# Expanded city/neighborhood keywords for flexible matching
+LOCATION_KEYWORDS = {
+    "Woodland Hills": ["woodland hills", "woodland", "91364", "91367", "91371"],
+    "West Hills": ["west hills", "canoga park", "winnetka", "91307", "91304"],
+    "Newbury Park": ["newbury park", "newbury", "91320"],
+    "Calabasas": ["calabasas", "91302"],
+    "Sherman Oaks": ["sherman oaks", "sherman", "91403", "91423"],
+    "Thousand Oaks": ["thousand oaks", "t.o.", "91360", "91362"],
+    "Oak Park": ["oak park", "91377"],
+    "Simi Valley": ["simi valley", "simi", "93063", "93065"],
 }
 
 NO_PET_MARKERS = [
@@ -57,6 +69,30 @@ USER_AGENTS = [
 def normalize_city(city: str) -> str:
     key = city.strip().lower()
     return CITY_ALIASES.get(key, city)
+
+
+def detect_city_from_text(text: str, queried_city: str) -> str:
+    """
+    Try to detect which city a listing belongs to from its text.
+    Returns normalized city name, defaulting to queried city.
+    """
+    text_lower = text.lower()
+    
+    # First check if queried city or its keywords are in the text
+    if queried_city in LOCATION_KEYWORDS:
+        for keyword in LOCATION_KEYWORDS[queried_city]:
+            if keyword in text_lower:
+                return normalize_city(queried_city)
+    
+    # Fall back to checking all known cities
+    for city, keywords in LOCATION_KEYWORDS.items():
+        for keyword in keywords:
+            if keyword in text_lower:
+                return normalize_city(city)
+    
+    # If nothing matches, accept the queried city anyway
+    # (Craigslist search should have already filtered geographically)
+    return normalize_city(queried_city)
 
 
 def is_no_pets_listing(text: str) -> bool:
@@ -195,7 +231,6 @@ def fetch_city(city_query: str) -> List[Dict[str, object]]:
     cards = soup.select(".cl-static-search-result, .result-row")
 
     listings: List[Dict[str, object]] = []
-    city_lower = city_query.lower()
     for card in cards:
         link_tag = card.select_one("a[href]")
         if not link_tag:
@@ -206,31 +241,40 @@ def fetch_city(city_query: str) -> List[Dict[str, object]]:
             continue
         full_url = urljoin("https://losangeles.craigslist.org", href)
 
-        title_tag = card.select_one(".title, .titlestring, .posting-title")
+        # Extract title from multiple possible locations
+        title_tag = card.select_one(".title, .titlestring, .posting-title, .cl-posting-title")
         title = (title_tag.get_text(" ", strip=True) if title_tag else "").strip()
         if not title:
             title = link_tag.get_text(" ", strip=True)
 
-        price_tag = card.select_one(".price, .priceinfo, .result-price")
+        # Extract price
+        price_tag = card.select_one(".price, .priceinfo, .result-price, .priceinfo .price")
         price_text = price_tag.get_text(" ", strip=True) if price_tag else title
         price = extract_price(price_text if "$" in price_text else title)
         if price < SEARCH_CONFIG["min_price"] or price > SEARCH_CONFIG["max_price"]:
             continue
 
+        # Get full card text and location metadata
         body_text = card.get_text(" ", strip=True)
-        if city_lower not in body_text.lower():
-            continue
-
-        bedrooms = extract_bedrooms(f"{title} {body_text}")
+        
+        # Extract location info from "housing" or "meta" tags
+        housing_tag = card.select_one(".housing, .result-hood, .meta .result-hood")
+        location_text = housing_tag.get_text(" ", strip=True) if housing_tag else ""
+        
+        # Combine all text for city detection
+        combined_text = f"{title} {body_text} {location_text}"
+        
+        bedrooms = extract_bedrooms(combined_text)
         if bedrooms < SEARCH_CONFIG["min_bedrooms"]:
             continue
 
-        if is_no_pets_listing(body_text):
+        if is_no_pets_listing(combined_text):
             continue
 
-        city = normalize_city(city_query)
+        # Use flexible city detection instead of strict filter
+        city = detect_city_from_text(combined_text, city_query)
         property_type = infer_property_type(title, body_text)
-        sqft = extract_square_feet(f"{title} {body_text}")
+        sqft = extract_square_feet(combined_text)
 
         id_match = re.search(r"/(\d+)\.html", full_url)
         listing_id = f"craigslist:{id_match.group(1)}" if id_match else f"craigslist:{hash(full_url)}"

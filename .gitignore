@@ -1,0 +1,31 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Local virtualenvs
+.venv/
+.venv-*/
+.venv*/
+
+# Local credentials/secrets (do not commit)
+credentials/
+*.key
+*.pem
+
+# Local logs/data artifacts
+logs/
+data/
+
+# Cursor / editor artifacts
+.cursor/
+
+# Node artifacts (web has its own .gitignore too)
+node_modules/
+
+# Local one-off maintenance scripts
+fix_sheet.py

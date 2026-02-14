@@ -1,0 +1,266 @@
+name: Scrape Listings
+
+on:
+  schedule:
+    - cron: "0 18 * * *" # 10 AM PT
+    - cron: "0 22 * * *" # 2 PM PT
+  workflow_dispatch: {}
+
+jobs:
+  scrape-and-write-sheet:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install runtime dependencies
+        run: npm install googleapis fast-xml-parser
+
+      - name: Scrape Craigslist and append to Google Sheet
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+        run: |
+          node <<'NODE'
+          const { google } = require('googleapis');
+          const { XMLParser } = require('fast-xml-parser');
+
+          const CONFIG = {
+            minPrice: 2000,
+            maxPrice: 2700,
+            minBedrooms: 1,
+            locations: [
+              'Woodland Hills',
+              'West Hills',
+              'Newbury Park',
+              'Calabasas',
+              'Sherman Oaks',
+              'Thousand Oaks',
+              'Oak Park',
+              'Simi Valley',
+            ],
+          };
+
+          const CITY_ALIASES = {
+            'canoga park': 'West Hills',
+            'winnetka': 'West Hills',
+            'reseda': 'Woodland Hills',
+            'encino': 'Woodland Hills',
+            'northridge': 'Woodland Hills',
+          };
+
+          const NO_PET_MARKERS = ['no pets', 'no pet', 'pets not allowed', 'pet free', 'no dogs', 'no cats'];
+
+          function normalizeCity(city) {
+            const lower = (city || '').toLowerCase().trim();
+            return CITY_ALIASES[lower] || city;
+          }
+
+          function inferPropertyType(title, description) {
+            const s = `${title} ${description}`.toLowerCase();
+            if (/(house|single[\s-]family|sfr)/.test(s) && !/townhouse/.test(s)) return 'house';
+            if (/(apartment|apt|studio)/.test(s)) return 'apartment';
+            if (/(condo|condominium)/.test(s)) return 'condo';
+            if (/(townhouse|town[\s-]house|townhome)/.test(s)) return 'townhouse';
+            if (/(adu|granny[\s-]flat|in[\s-]law|guest[\s-]house)/.test(s)) return 'adu';
+            return 'other';
+          }
+
+          function categoryBucket(propertyType) {
+            if (propertyType === 'house' || propertyType === 'adu') return 'House';
+            if (propertyType === 'apartment') return 'Apartment';
+            if (propertyType === 'condo' || propertyType === 'townhouse') return 'Condo/Townhouse';
+            return 'Other/Unknown';
+          }
+
+          function isNoPetsListing(text) {
+            const lower = (text || '').toLowerCase();
+            return NO_PET_MARKERS.some((m) => lower.includes(m));
+          }
+
+          function asArray(v) {
+            if (!v) return [];
+            return Array.isArray(v) ? v : [v];
+          }
+
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+          async function fetchRssWithRetries(cityQuery) {
+            const q = encodeURIComponent(cityQuery);
+            const urls = [
+              `https://losangeles.craigslist.org/search/apa?format=rss&query=${q}&min_price=${CONFIG.minPrice}&max_price=${CONFIG.maxPrice}&min_bedrooms=${CONFIG.minBedrooms}`,
+              `https://losangeles.craigslist.org/search/apa?query=${q}&min_price=${CONFIG.minPrice}&max_price=${CONFIG.maxPrice}&min_bedrooms=${CONFIG.minBedrooms}&format=rss&sort=date`,
+              `https://losangeles.craigslist.org/search/apa?query=${q}&format=rss`,
+            ];
+            const userAgents = [
+              'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+              'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            ];
+
+            let last = 'unknown error';
+            for (const url of urls) {
+              for (let i = 1; i <= 3; i++) {
+                try {
+                  const res = await fetch(url, {
+                    headers: {
+                      'User-Agent': userAgents[(i - 1) % userAgents.length],
+                      'Accept': 'application/rss+xml, application/xml;q=0.9, */*;q=0.8',
+                      'Referer': 'https://losangeles.craigslist.org/',
+                    },
+                  });
+                  if (!res.ok) {
+                    last = `HTTP ${res.status}`;
+                    if (res.status === 403 || res.status === 429 || res.status >= 500) {
+                      await sleep(400 * 2 ** (i - 1) + Math.floor(Math.random() * 300));
+                      continue;
+                    }
+                    throw new Error(last);
+                  }
+                  return await res.text();
+                } catch (e) {
+                  last = e && e.message ? e.message : String(e);
+                  await sleep(400 * 2 ** (i - 1) + Math.floor(Math.random() * 300));
+                }
+              }
+            }
+            throw new Error(last);
+          }
+
+          async function fetchCity(cityQuery) {
+            const xml = await fetchRssWithRetries(cityQuery);
+            const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
+            const parsed = parser.parse(xml);
+            const items = asArray(parsed?.rss?.channel?.item);
+            const out = [];
+
+            for (const item of items) {
+              const title = item.title || '';
+              const url = item.link || '';
+              const description = item.description || '';
+              const timestamp = item['dc:date'] || new Date().toISOString();
+              if (!title || !url) continue;
+              if (isNoPetsListing(title) || isNoPetsListing(description)) continue;
+
+              const priceMatch = title.match(/\$(\d+)/);
+              const price = priceMatch ? parseInt(priceMatch[1], 10) : 0;
+              if (price && (price < CONFIG.minPrice || price > CONFIG.maxPrice)) continue;
+
+              const bedMatch = title.match(/(\d+)br/i);
+              const bedrooms = bedMatch ? parseInt(bedMatch[1], 10) : 1;
+              if (bedrooms < CONFIG.minBedrooms) continue;
+
+              let city = cityQuery;
+              const lower = title.toLowerCase();
+              for (const loc of CONFIG.locations) {
+                if (lower.includes(loc.toLowerCase())) {
+                  city = loc;
+                  break;
+                }
+              }
+              city = normalizeCity(city);
+
+              const property_type = inferPropertyType(title, description);
+              const category_bucket = categoryBucket(property_type);
+              const idMatch = url.match(/\/(\d+)\.html/);
+              const listing_id = `craigslist:${idMatch ? idMatch[1] : `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
+              const address = title.split('-').slice(1).join('-').trim() || title;
+
+              out.push({
+                listing_id,
+                source: 'craigslist',
+                first_seen_at: timestamp,
+                city,
+                price,
+                bedrooms,
+                property_type,
+                category_bucket,
+                status: 'new',
+                address,
+                url,
+              });
+            }
+
+            return out;
+          }
+
+          async function main() {
+            const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+            const spreadsheetId = process.env.GOOGLE_SHEET_ID;
+            if (!raw) throw new Error('Missing GOOGLE_SERVICE_ACCOUNT_JSON');
+            if (!spreadsheetId) throw new Error('Missing GOOGLE_SHEET_ID');
+
+            const credentials = JSON.parse(raw);
+            const auth = new google.auth.GoogleAuth({
+              credentials,
+              scopes: [
+                'https://www.googleapis.com/auth/spreadsheets',
+                'https://www.googleapis.com/auth/drive',
+              ],
+            });
+            const sheets = google.sheets({ version: 'v4', auth });
+
+            const existingRes = await sheets.spreadsheets.values.get({
+              spreadsheetId,
+              range: 'Sheet1!A2:A',
+            });
+            const existingIds = new Set((existingRes.data.values || []).map((r) => r[0]).filter(Boolean));
+
+            const results = await Promise.allSettled(CONFIG.locations.map((city) => fetchCity(city)));
+            const all = [];
+            const errors = [];
+            for (const r of results) {
+              if (r.status === 'fulfilled') all.push(...r.value);
+              else errors.push(r.reason?.message || String(r.reason));
+            }
+
+            const deduped = [];
+            const seen = new Set();
+            for (const l of all) {
+              if (seen.has(l.listing_id) || existingIds.has(l.listing_id)) continue;
+              seen.add(l.listing_id);
+              deduped.push(l);
+            }
+
+            if (deduped.length) {
+              const rows = deduped.map((l) => [
+                l.listing_id,
+                l.source,
+                l.first_seen_at,
+                l.city,
+                l.price,
+                l.bedrooms,
+                l.property_type,
+                l.category_bucket,
+                l.status,
+                l.address,
+                l.url,
+              ]);
+              await sheets.spreadsheets.values.append({
+                spreadsheetId,
+                range: 'Sheet1!A:K',
+                valueInputOption: 'RAW',
+                requestBody: { values: rows },
+              });
+            }
+
+            const summary = {
+              totalFetched: all.length,
+              newCount: deduped.length,
+              errors,
+            };
+            console.log(JSON.stringify(summary, null, 2));
+
+            // Keep workflow green if source blocks; preserve existing sheet data.
+            if (all.length === 0 && errors.length > 0) {
+              console.warn('Craigslist blocked this run; no new rows appended.');
+            }
+          }
+
+          main().catch((e) => {
+            console.error(e);
+            process.exit(1);
+          });
+          NODE
